@@ -178,12 +178,27 @@ class GatewayAuthorizationMixin:
         return None
 
     def _adapter_profile_for_source(self, source: SessionSource) -> Optional[str]:
-        """Resolve the transport-owning profile for adapter policy lookups."""
+        """Resolve the transport-owning profile for adapter policy and delivery.
+
+        The primary adapter registry belongs to the active gateway profile,
+        even when ``source.profile`` names a different routed runtime. Returning
+        that owner explicitly lets downstream session tools distinguish a shared
+        credential from a real secondary-profile bot.
+        """
         adapter = self._registered_transport_adapter(source)
         platform = getattr(source, "platform", None)
         if adapter is not None:
             if adapter is (getattr(self, "adapters", None) or {}).get(platform):
-                return None
+                active_profile_fn = getattr(self, "_active_profile_name", None)
+                if callable(active_profile_fn):
+                    try:
+                        active_profile = str(active_profile_fn() or "").strip()
+                        return active_profile or "default"
+                    except Exception:
+                        pass
+                # Provenance already established that this is the primary
+                # registry, whose legacy identity is the default profile.
+                return "default"
             for profile, profile_adapters in (
                 getattr(self, "_profile_adapters", None) or {}
             ).items():

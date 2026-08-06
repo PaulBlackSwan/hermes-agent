@@ -74,6 +74,48 @@ def test_active_profile_stamp_resolves_primary_adapter(monkeypatch):
     assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
 
 
+def test_transport_profile_uses_primary_adapter_owner_not_routed_runtime(monkeypatch):
+    runner, default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._active_profile_name = lambda: "default"
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="allowed-user",
+        chat_id="routed-chat",
+        chat_type="dm",
+        profile="daily",
+    )
+    source._transport_adapter_ref = lambda: default_adapter
+
+    assert runner._adapter_profile_for_source(source) == "default"
+    from gateway.session_context import get_session_env
+
+    tokens = runner._set_session_env(
+        SimpleNamespace(source=source, session_key="daily-routed-session")
+    )
+    try:
+        assert get_session_env("HERMES_SESSION_PROFILE") == "daily"
+        assert get_session_env("HERMES_SESSION_TRANSPORT_PROFILE") == "default"
+    finally:
+        runner._clear_session_env(tokens)
+
+
+def test_transport_profile_keeps_distinct_secondary_bot_isolated(monkeypatch):
+    runner, default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._active_profile_name = lambda: "default"
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="allowed-user",
+        chat_id="coder-chat",
+        chat_type="dm",
+        profile="coder",
+    )
+    source._transport_adapter_ref = lambda: secondary_adapter
+
+    assert runner._adapter_profile_for_source(source) == "coder"
+    assert runner._adapter_for_source(source) is secondary_adapter
+    assert runner._adapter_for_source(source) is not default_adapter
+
+
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
     """Unauthorized-DM behavior must read the secondary adapter's dm_policy."""
     runner, _default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)

@@ -507,6 +507,26 @@ class GatewaySlashCommandsMixin:
                         if chat_type:
                             delivery_metadata.setdefault("chat_type", chat_type)
                     if platform_str and chat_id:
+                        adapter_profile_fn = getattr(
+                            self, "_adapter_profile_for_source", None
+                        )
+                        notifier_profile = (
+                            adapter_profile_fn(source)
+                            if callable(adapter_profile_fn)
+                            else None
+                        )
+                        if not notifier_profile:
+                            active_profile_fn = getattr(
+                                self, "_active_profile_name", None
+                            )
+                            notifier_profile = getattr(
+                                self, "_kanban_notifier_profile", None
+                            ) or (
+                                active_profile_fn()
+                                if callable(active_profile_fn)
+                                else None
+                            )
+                        notifier_profile = str(notifier_profile or "").strip() or None
                         def _sub():
                             from hermes_cli import kanban_db as _kb
                             conn = _kb.connect(board=requested_board)
@@ -517,7 +537,7 @@ class GatewaySlashCommandsMixin:
                                     chat_type=chat_type,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
-                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                    notifier_profile=notifier_profile,
                                     delivery_metadata=delivery_metadata,
                                 )
                             finally:

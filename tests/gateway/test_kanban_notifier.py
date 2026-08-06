@@ -1,6 +1,9 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 from gateway.config import Platform
@@ -212,6 +215,150 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     assert [delivery["chat_id"] for delivery in adapter.sent] == ["writer-chat"]
     assert owned_tid in adapter.sent[0]["text"]
     assert len(_unseen_terminal_events_for(foreign_tid, "default-chat")) == 1
+
+
+@pytest.mark.parametrize("terminal_kind", ["completed", "blocked"])
+def test_routed_runtime_auto_subscription_uses_receiving_transport_profile(
+    tmp_path, monkeypatch, terminal_kind,
+):
+    """A daily runtime routed through default's Telegram bot notifies via default."""
+    db_path = tmp_path / f"routed-{terminal_kind}.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title=terminal_kind, assignee="worker")
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="shared-bot-chat",
+            thread_id="2",
+            profile="daily",
+            transport_profile="default",
+        )
+        try:
+            assert kanban_tools._maybe_auto_subscribe(conn, task_id) is True
+        finally:
+            clear_session_vars(tokens)
+
+        [subscription] = kb.list_notify_subs(conn, task_id)
+        assert subscription["notifier_profile"] == "default"
+        if terminal_kind == "completed":
+            kb.complete_task(conn, task_id, summary="done through shared bot")
+        else:
+            kb.block_task(conn, task_id, reason="review needed", kind="needs_input")
+    finally:
+        conn.close()
+
+    default_adapter = RecordingAdapter()
+    runner = _make_runner(default_adapter)
+    runner._kanban_notifier_profile = "default"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [delivery["chat_id"] for delivery in default_adapter.sent] == [
+        "shared-bot-chat"
+    ]
+    assert terminal_kind in default_adapter.sent[0]["text"]
+
+
+def test_distinct_profile_bot_auto_subscription_stays_on_its_own_adapter(
+    tmp_path, monkeypatch,
+):
+    """A real daily Telegram adapter must never leak notifications to default."""
+    db_path = tmp_path / "distinct-bot.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="daily bot", assignee="worker")
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="daily-bot-chat",
+            profile="daily",
+            transport_profile="daily",
+        )
+        try:
+            assert kanban_tools._maybe_auto_subscribe(conn, task_id) is True
+        finally:
+            clear_session_vars(tokens)
+        [subscription] = kb.list_notify_subs(conn, task_id)
+        assert subscription["notifier_profile"] == "daily"
+        kb.complete_task(conn, task_id, summary="daily done")
+    finally:
+        conn.close()
+
+    default_adapter = RecordingAdapter()
+    daily_adapter = RecordingAdapter()
+    runner = _make_runner(default_adapter)
+    runner._kanban_notifier_profile = "default"
+    runner._profile_adapters = {"daily": {Platform.TELEGRAM: daily_adapter}}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert default_adapter.sent == []
+    assert [delivery["chat_id"] for delivery in daily_adapter.sent] == [
+        "daily-bot-chat"
+    ]
+
+
+def test_slash_create_stamps_shared_and_distinct_transport_owners(
+    tmp_path, monkeypatch,
+):
+    """The direct /kanban create path follows adapter provenance too."""
+    db_path = tmp_path / "slash-transport-owner.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    default_adapter = RecordingAdapter()
+    daily_adapter = RecordingAdapter()
+
+    def _run_create(chat_id, transport_adapter, profile_adapters):
+        runner = _make_runner(default_adapter)
+        runner._profile_adapters = profile_adapters
+        source = SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            chat_type="group",
+            thread_id="2",
+            user_id="requester",
+            profile="daily",
+            _transport_adapter_ref=lambda: transport_adapter,
+        )
+        event = SimpleNamespace(
+            text=f'/kanban create "{chat_id}" --assignee worker',
+            source=source,
+            message_id="12",
+            reply_to_message_id=None,
+        )
+        return asyncio.run(runner._handle_kanban_command(event))
+
+    shared_output = _run_create("shared-chat", default_adapter, {})
+    distinct_output = _run_create(
+        "daily-chat",
+        daily_adapter,
+        {"daily": {Platform.TELEGRAM: daily_adapter}},
+    )
+
+    assert "subscribed" in shared_output.lower()
+    assert "subscribed" in distinct_output.lower()
+    conn = kb.connect()
+    try:
+        owners_by_chat = {
+            sub["chat_id"]: sub["notifier_profile"]
+            for sub in kb.list_notify_subs(conn)
+        }
+    finally:
+        conn.close()
+    assert owners_by_chat == {
+        "shared-chat": "default",
+        "daily-chat": "daily",
+    }
 
 
 def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
