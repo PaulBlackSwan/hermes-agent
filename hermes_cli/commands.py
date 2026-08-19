@@ -185,6 +185,15 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("pause", "Pause new work globally (emergency stop); '/pause off' resumes", "Session",
                gateway_only=True, args_hint="[reason | off]",
                busy_policy="dispatch"),
+    CommandDef(
+        "delegate",
+        "Grant temporary non-admin access to the current Slack thread",
+        "Session",
+        aliases=("grant",),
+        args_hint="<@user> <1m-24h> <purpose> | status | revoke <@user>",
+        gateway_only=True,
+        busy_policy="dispatch",
+    ),
     CommandDef("approve", "Approve a pending dangerous command", "Session",
                gateway_only=True, args_hint="[session|always]", busy_policy="dispatch"),
     CommandDef("deny", "Deny a pending dangerous command (optionally with a reason)", "Session",
@@ -1346,7 +1355,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "whoami", "platform"})
+#   - delegate: security-sensitive temporary grants are intentionally invoked as
+#     an addressed thread message (`@Hermes /delegate ...`) so Slack preserves
+#     the authored thread_ts used for exact-scope authorization.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "whoami", "platform", "delegate", "grant"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

@@ -21,13 +21,15 @@ Storage: ~/.hermes/pairing/
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases,
@@ -42,6 +44,15 @@ from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
+try:  # pragma: no cover - platform-specific import
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+try:  # pragma: no cover - platform-specific import
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
+
 
 # Unambiguous alphabet -- excludes 0/O, 1/I to prevent confusion
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -55,6 +66,11 @@ LOCKOUT_SECONDS = 3600              # Lockout duration after too many failures
 # Limits
 MAX_PENDING_PER_PLATFORM = 3        # Max pending codes per platform
 MAX_FAILED_ATTEMPTS = 5             # Failed approvals before lockout
+MIN_TEMPORARY_DELEGATION_SECONDS = 60
+MAX_TEMPORARY_DELEGATION_SECONDS = 24 * 60 * 60
+MAX_TEMPORARY_DELEGATION_PURPOSE_CHARS = 500
+TEMPORARY_DELEGATION_SCHEMA_VERSION = 1
+MAX_TEMPORARY_DELEGATION_AUDIT_EVENTS = 10_000
 
 PAIRING_DIR = get_hermes_dir("platforms/pairing", "pairing")
 
@@ -332,9 +348,155 @@ def _load_json_file(path: Path) -> dict:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeError):
             return {}
     return {}
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    """Hold one private advisory file lock across processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            getattr(msvcrt, "locking")(
+                handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1
+            )
+        yield
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover - Windows
+                handle.seek(0)
+                getattr(msvcrt, "locking")(
+                    handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1
+                )
+        finally:
+            handle.close()
+
+
+def _temporary_audit_event_is_valid(event: Any) -> bool:
+    if not isinstance(event, dict) or set(event) != {
+        "event",
+        "occurred_at",
+        "grant_id",
+        "grant",
+    }:
+        return False
+    if event.get("event") not in {
+        "granted",
+        "refreshed",
+        "expired",
+        "invalid_record_pruned",
+        "revoked",
+    }:
+        return False
+    occurred_at = event.get("occurred_at")
+    if (
+        isinstance(occurred_at, bool)
+        or not isinstance(occurred_at, (int, float))
+        or not math.isfinite(float(occurred_at))
+    ):
+        return False
+    return (
+        isinstance(event.get("grant_id"), str)
+        and bool(event["grant_id"])
+        and isinstance(event.get("grant"), dict)
+    )
+
+
+def _temporary_state_for_merge(path: Path) -> Optional[dict]:
+    """Read structurally valid delegation state without authorizing records."""
+    if not path.exists():
+        return {
+            "version": TEMPORARY_DELEGATION_SCHEMA_VERSION,
+            "grants": {},
+            "audit": [],
+        }
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(state, dict)
+        or set(state) != {"version", "grants", "audit"}
+        or type(state.get("version")) is not int
+        or state.get("version") != TEMPORARY_DELEGATION_SCHEMA_VERSION
+        or not isinstance(state.get("grants"), dict)
+        or not isinstance(state.get("audit"), list)
+        or len(state.get("audit", [])) > MAX_TEMPORARY_DELEGATION_AUDIT_EVENTS
+        or any(
+            not _temporary_audit_event_is_valid(event)
+            for event in state.get("audit", [])
+        )
+    ):
+        return None
+    return state
+
+
+def _merge_temporary_delegation_file(src: Path, dest: Path) -> None:
+    """Merge exact grant/audit collections while locking both layouts."""
+    platform = src.name.removesuffix("-delegations.json")
+    lock_paths = sorted(
+        {
+            src.parent / f".{platform}-delegations.lock",
+            dest.parent / f".{platform}-delegations.lock",
+        },
+        key=lambda value: str(value),
+    )
+    with _exclusive_file_lock(lock_paths[0]):
+        with _exclusive_file_lock(lock_paths[1]):
+            alternate = _temporary_state_for_merge(src)
+            current = _temporary_state_for_merge(dest)
+            if alternate is None or current is None:
+                logger.warning(
+                    "Skipping corrupt temporary delegation migration: %s -> %s",
+                    src,
+                    dest,
+                )
+                return
+            grants = dict(alternate["grants"])
+            grants.update(current["grants"])
+            audit = list(alternate["audit"]) + list(current["audit"])
+            deduped_audit = []
+            seen = set()
+            for event in audit:
+                try:
+                    marker = json.dumps(event, sort_keys=True, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    continue
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                deduped_audit.append(event)
+            deduped_audit.sort(
+                key=lambda event: (
+                    float(event.get("occurred_at", 0))
+                    if isinstance(event, dict)
+                    and isinstance(event.get("occurred_at"), (int, float))
+                    else 0
+                )
+            )
+            merged = {
+                "version": TEMPORARY_DELEGATION_SCHEMA_VERSION,
+                "grants": grants,
+                "audit": deduped_audit[-MAX_TEMPORARY_DELEGATION_AUDIT_EVENTS:],
+            }
+            if merged != current:
+                _secure_write(dest, json.dumps(merged, indent=2, ensure_ascii=False))
 
 
 def _merge_pairing_dir(active_dir: Path, alternate_dir: Path) -> None:
@@ -352,6 +514,9 @@ def _merge_pairing_dir(active_dir: Path, alternate_dir: Path) -> None:
         if not src.is_file():
             continue
         dest = active_dir / src.name
+        if src.name.endswith("-delegations.json"):
+            _merge_temporary_delegation_file(src, dest)
+            continue
         merged = _load_json_file(src)
         if not merged:
             continue
@@ -464,6 +629,82 @@ class PairingStore:
     def _rate_limit_path(self) -> Path:
         return self._dir / "_rate_limits.json"
 
+    def _delegations_path(self, platform: str) -> Path:
+        return self._dir / f"{platform}-delegations.json"
+
+    def _delegations_lock_path(self, platform: str) -> Path:
+        return self._dir / f".{platform}-delegations.lock"
+
+    @contextmanager
+    def _temporary_delegation_process_lock(self, platform: str):
+        """Serialize delegation read-modify-write cycles across processes."""
+        with _exclusive_file_lock(self._delegations_lock_path(platform)):
+            yield
+
+    @staticmethod
+    def _empty_temporary_delegation_state() -> dict:
+        return {
+            "version": TEMPORARY_DELEGATION_SCHEMA_VERSION,
+            "grants": {},
+            "audit": [],
+        }
+
+    def _load_temporary_delegation_state(self, platform: str) -> dict:
+        """Strictly load security state; corruption fails closed, never resets."""
+        path = self._delegations_path(platform)
+        if not path.exists():
+            return self._empty_temporary_delegation_state()
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"temporary delegation state is unreadable: {path}"
+            ) from exc
+        if (
+            not isinstance(state, dict)
+            or set(state) != {"version", "grants", "audit"}
+            or type(state.get("version")) is not int
+            or state.get("version") != TEMPORARY_DELEGATION_SCHEMA_VERSION
+            or not isinstance(state.get("grants"), dict)
+            or not isinstance(state.get("audit"), list)
+            or len(state.get("audit", [])) > MAX_TEMPORARY_DELEGATION_AUDIT_EVENTS
+            or any(
+                not _temporary_audit_event_is_valid(event)
+                for event in state.get("audit", [])
+            )
+        ):
+            raise RuntimeError(
+                f"temporary delegation state has an invalid schema: {path}"
+            )
+        return state
+
+    def _save_temporary_delegation_state(self, platform: str, state: dict) -> None:
+        _secure_write(
+            self._delegations_path(platform),
+            json.dumps(state, indent=2, ensure_ascii=False),
+        )
+
+    @staticmethod
+    def _append_temporary_delegation_audit(
+        state: dict,
+        *,
+        event: str,
+        occurred_at: float,
+        grant_id: str,
+        grant: dict,
+    ) -> None:
+        state["audit"].append(
+            {
+                "event": event,
+                "occurred_at": float(occurred_at),
+                "grant_id": grant_id,
+                "grant": dict(grant),
+            }
+        )
+        overflow = len(state["audit"]) - MAX_TEMPORARY_DELEGATION_AUDIT_EVENTS
+        if overflow > 0:
+            del state["audit"][:overflow]
+
     def _load_json(self, path: Path) -> dict:
         if path.exists():
             try:
@@ -574,6 +815,347 @@ class PairingStore:
                 _sync_allowlist_remove(platform, user_id)
                 return True
         return False
+
+    # ----- Temporary thread-scoped delegations -----
+
+    @staticmethod
+    def _temporary_delegation_key(
+        platform: str,
+        scope_id: str,
+        chat_id: str,
+        thread_id: str,
+        user_id: str,
+    ) -> str:
+        canonical = "\x00".join(
+            (platform, scope_id, chat_id, thread_id, user_id)
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()[:24]
+
+    def _temporary_delegation_record_is_valid(
+        self,
+        grant_id: str,
+        grant: Any,
+    ) -> bool:
+        if not isinstance(grant, dict):
+            return False
+        if set(grant) != {
+            "platform",
+            "user_id",
+            "user_name",
+            "chat_id",
+            "thread_id",
+            "scope_id",
+            "granted_by",
+            "purpose",
+            "created_at",
+            "expires_at",
+        }:
+            return False
+        required_strings = (
+            "platform",
+            "user_id",
+            "chat_id",
+            "thread_id",
+            "scope_id",
+            "granted_by",
+            "purpose",
+        )
+        if any(
+            not isinstance(grant.get(key), str) or not grant[key]
+            for key in required_strings
+        ):
+            return False
+        if not isinstance(grant.get("user_name"), str):
+            return False
+        created_at = grant.get("created_at")
+        expires_at = grant.get("expires_at")
+        if (
+            isinstance(created_at, bool)
+            or isinstance(expires_at, bool)
+            or not isinstance(created_at, (int, float))
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(float(created_at))
+            or not math.isfinite(float(expires_at))
+        ):
+            return False
+        duration = float(expires_at) - float(created_at)
+        if not (
+            MIN_TEMPORARY_DELEGATION_SECONDS
+            <= duration
+            <= MAX_TEMPORARY_DELEGATION_SECONDS
+        ):
+            return False
+        if (
+            not grant["purpose"].strip()
+            or len(grant["purpose"]) > MAX_TEMPORARY_DELEGATION_PURPOSE_CHARS
+        ):
+            return False
+        expected_id = self._temporary_delegation_key(
+            grant["platform"],
+            grant["scope_id"],
+            grant["chat_id"],
+            grant["thread_id"],
+            grant["user_id"],
+        )
+        return grant_id == expected_id
+
+    def _cleanup_expired_temporary_locked(
+        self,
+        state: dict,
+        *,
+        now: float,
+    ) -> bool:
+        grants = state["grants"]
+        expired = []
+        for grant_id, grant in grants.items():
+            invalid = not self._temporary_delegation_record_is_valid(
+                grant_id, grant
+            )
+            expires_at = 0.0
+            if not invalid:
+                try:
+                    expires_at = float(grant.get("expires_at") or 0)
+                    invalid = not math.isfinite(expires_at)
+                except (TypeError, ValueError):
+                    invalid = True
+            if invalid or expires_at <= now:
+                expired.append((grant_id, grant, invalid))
+        for grant_id, grant, invalid in expired:
+            grants.pop(grant_id, None)
+            self._append_temporary_delegation_audit(
+                state,
+                event="invalid_record_pruned" if invalid else "expired",
+                occurred_at=now,
+                grant_id=grant_id,
+                grant=grant if isinstance(grant, dict) else {"raw_type": type(grant).__name__},
+            )
+        if expired:
+            logger.info(
+                "Pruned %d expired/invalid temporary delegation record(s)",
+                len(expired),
+            )
+        return bool(expired)
+
+    def grant_temporary(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        user_name: str,
+        chat_id: str,
+        thread_id: str,
+        scope_id: str,
+        granted_by: str,
+        duration_seconds: int,
+        purpose: str,
+        now: Optional[float] = None,
+    ) -> dict:
+        """Create or refresh an exact user/workspace/channel/thread grant."""
+        platform = str(platform or "").strip().lower()
+        user_id = self._normalize_user_id(platform, user_id)
+        user_name = str(user_name or "").strip()
+        chat_id = str(chat_id or "").strip()
+        thread_id = str(thread_id or "").strip()
+        scope_id = str(scope_id or "").strip()
+        granted_by = self._normalize_user_id(platform, granted_by)
+        purpose = " ".join(str(purpose or "").split())
+        try:
+            duration_seconds = int(duration_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("temporary delegation duration must be an integer") from exc
+
+        if not all((platform, user_id, chat_id, thread_id, scope_id, granted_by)):
+            raise ValueError(
+                "temporary delegation requires platform, user, workspace, channel, "
+                "thread, and grantor"
+            )
+        if not (
+            MIN_TEMPORARY_DELEGATION_SECONDS
+            <= duration_seconds
+            <= MAX_TEMPORARY_DELEGATION_SECONDS
+        ):
+            raise ValueError("temporary delegation duration must be between 1m and 24h")
+        if not purpose:
+            raise ValueError("temporary delegation purpose is required")
+        if len(purpose) > MAX_TEMPORARY_DELEGATION_PURPOSE_CHARS:
+            raise ValueError(
+                f"temporary delegation purpose exceeds "
+                f"{MAX_TEMPORARY_DELEGATION_PURPOSE_CHARS} characters"
+            )
+
+        now_value = time.time() if now is None else float(now)
+        if not math.isfinite(now_value):
+            raise ValueError("temporary delegation clock must be finite")
+        grant = {
+            "platform": platform,
+            "user_id": user_id,
+            "user_name": user_name,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "scope_id": scope_id,
+            "granted_by": granted_by,
+            "purpose": purpose,
+            "created_at": now_value,
+            "expires_at": now_value + duration_seconds,
+        }
+        grant_id = self._temporary_delegation_key(
+            platform, scope_id, chat_id, thread_id, user_id
+        )
+        with self._lock, self._temporary_delegation_process_lock(platform):
+            state = self._load_temporary_delegation_state(platform)
+            self._cleanup_expired_temporary_locked(state, now=now_value)
+            event_name = "refreshed" if grant_id in state["grants"] else "granted"
+            state["grants"][grant_id] = grant
+            self._append_temporary_delegation_audit(
+                state,
+                event=event_name,
+                occurred_at=now_value,
+                grant_id=grant_id,
+                grant=grant,
+            )
+            self._save_temporary_delegation_state(platform, state)
+        logger.info(
+            "Temporary delegation granted: platform=%s user=%s scope=%s "
+            "chat=%s thread=%s grantor=%s expires_at=%.3f",
+            platform,
+            user_id,
+            scope_id,
+            chat_id,
+            thread_id,
+            granted_by,
+            grant["expires_at"],
+        )
+        return dict(grant)
+
+    def get_active_delegation(
+        self,
+        source: Any,
+        *,
+        now: Optional[float] = None,
+    ) -> Optional[dict]:
+        """Return the exact active delegation for a SessionSource-like object."""
+        platform_obj = getattr(source, "platform", None)
+        platform = str(getattr(platform_obj, "value", platform_obj) or "").strip().lower()
+        user_id = self._normalize_user_id(platform, getattr(source, "user_id", ""))
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        thread_id = str(getattr(source, "thread_id", "") or "").strip()
+        scope_id = str(
+            getattr(source, "scope_id", None)
+            or getattr(source, "guild_id", None)
+            or ""
+        ).strip()
+        if not all((platform, user_id, chat_id, thread_id, scope_id)):
+            return None
+
+        now_value = time.time() if now is None else float(now)
+        if not math.isfinite(now_value):
+            return None
+        grant_id = self._temporary_delegation_key(
+            platform, scope_id, chat_id, thread_id, user_id
+        )
+        with self._lock, self._temporary_delegation_process_lock(platform):
+            state = self._load_temporary_delegation_state(platform)
+            if self._cleanup_expired_temporary_locked(state, now=now_value):
+                self._save_temporary_delegation_state(platform, state)
+            grant = state["grants"].get(grant_id)
+            if not isinstance(grant, dict):
+                return None
+            expected = {
+                "platform": platform,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "scope_id": scope_id,
+            }
+            if any(str(grant.get(key) or "") != value for key, value in expected.items()):
+                return None
+            return dict(grant)
+
+    def list_temporary(
+        self,
+        *,
+        platform: str,
+        chat_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> list[dict]:
+        """List active grants, optionally narrowed to one exact Slack thread."""
+        platform = str(platform or "").strip().lower()
+        if not platform:
+            return []
+        now_value = time.time() if now is None else float(now)
+        if not math.isfinite(now_value):
+            return []
+        with self._lock, self._temporary_delegation_process_lock(platform):
+            state = self._load_temporary_delegation_state(platform)
+            if self._cleanup_expired_temporary_locked(state, now=now_value):
+                self._save_temporary_delegation_state(platform, state)
+            result = []
+            for grant in state["grants"].values():
+                if not isinstance(grant, dict):
+                    continue
+                if chat_id is not None and grant.get("chat_id") != str(chat_id):
+                    continue
+                if thread_id is not None and grant.get("thread_id") != str(thread_id):
+                    continue
+                if scope_id is not None and grant.get("scope_id") != str(scope_id):
+                    continue
+                result.append(dict(grant))
+        return sorted(result, key=lambda item: (item["expires_at"], item["user_id"]))
+
+    def revoke_temporary(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        chat_id: str,
+        thread_id: str,
+        scope_id: str,
+        revoked_by: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Revoke only the target user's grant in the exact thread scope."""
+        platform = str(platform or "").strip().lower()
+        user_id = self._normalize_user_id(platform, user_id)
+        chat_id = str(chat_id or "").strip()
+        thread_id = str(thread_id or "").strip()
+        scope_id = str(scope_id or "").strip()
+        revoked_by = self._normalize_user_id(platform, revoked_by or "")
+        if not all((platform, user_id, chat_id, thread_id, scope_id)):
+            return False
+        grant_id = self._temporary_delegation_key(
+            platform, scope_id, chat_id, thread_id, user_id
+        )
+        now_value = time.time() if now is None else float(now)
+        if not math.isfinite(now_value):
+            return False
+        with self._lock, self._temporary_delegation_process_lock(platform):
+            state = self._load_temporary_delegation_state(platform)
+            self._cleanup_expired_temporary_locked(state, now=now_value)
+            grant = state["grants"].pop(grant_id, None)
+            if grant is None:
+                self._save_temporary_delegation_state(platform, state)
+                return False
+            self._append_temporary_delegation_audit(
+                state,
+                event="revoked",
+                occurred_at=now_value,
+                grant_id=grant_id,
+                grant={**grant, "revoked_by": revoked_by or None},
+            )
+            self._save_temporary_delegation_state(platform, state)
+        logger.info(
+            "Temporary delegation revoked: platform=%s user=%s scope=%s "
+            "chat=%s thread=%s revoked_by=%s",
+            platform,
+            user_id,
+            scope_id,
+            chat_id,
+            thread_id,
+            revoked_by or "unknown",
+        )
+        return True
 
     # ----- Pending codes -----
 

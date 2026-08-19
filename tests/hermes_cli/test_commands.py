@@ -273,6 +273,12 @@ class TestSlackAppManifest:
         commands = [c["command"] for c in m["features"]["slash_commands"]]
         assert "/btw" in commands
 
+    def test_delegate_and_grant_are_addressed_thread_commands_only(self):
+        """Native Slack slashes do not preserve the authored thread scope."""
+        commands = {name for name, _desc, _hint in slack_native_slashes()}
+        assert "delegate" not in commands
+        assert "grant" not in commands
+
 
 # ---------------------------------------------------------------------------
 # Config-gated gateway commands

@@ -219,6 +219,15 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Internal, wire-invisible temporary delegation state. The gateway sets
+    # these only after an exact TTL/workspace/channel/thread/user grant matches.
+    # Never serialize them: persisted or relayed input must not be able to
+    # manufacture delegated authorization or an operator-trusted purpose.
+    temporary_delegated: bool = field(default=False, repr=False, compare=False)
+    delegation_purpose: Optional[str] = field(default=None, repr=False, compare=False)
+    delegation_expires_at: Optional[float] = field(default=None, repr=False, compare=False)
+    delegation_granted_by: Optional[str] = field(default=None, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -871,6 +880,12 @@ class SessionEntry:
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
+    # Exact source that triggered the active turn. Kept last for positional
+    # constructor compatibility. Unlike ``origin`` (the first participant in a
+    # shared thread), this identifies a temporary delegate so restart recovery
+    # can reauthorize the real actor instead of the owner.
+    active_turn_source: Optional[SessionSource] = None
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -902,6 +917,11 @@ class SessionEntry:
             "active_turn_started_at": (
                 self.active_turn_started_at.isoformat()
                 if self.active_turn_started_at
+                else None
+            ),
+            "active_turn_source": (
+                self.active_turn_source.to_dict()
+                if self.active_turn_source is not None
                 else None
             ),
             "is_fresh_reset": self.is_fresh_reset,
@@ -952,6 +972,21 @@ class SessionEntry:
             # malformed pair is not trustworthy enough to auto-resume.
             active_turn_token = None
             active_turn_started_at = None
+        active_turn_source = None
+        raw_active_turn_source = data.get("active_turn_source")
+        active_turn_source_invalid = False
+        if isinstance(raw_active_turn_source, dict):
+            try:
+                active_turn_source = SessionSource.from_dict(raw_active_turn_source)
+            except (KeyError, TypeError, ValueError):
+                active_turn_source_invalid = True
+        elif raw_active_turn_source is not None:
+            active_turn_source_invalid = True
+        if active_turn_source_invalid:
+            # An explicitly malformed actor record is not safe to replace with
+            # the thread's broader first-participant origin during recovery.
+            active_turn_token = None
+            active_turn_started_at = None
 
         session_key = data["session_key"]
         session_id = data["session_id"]
@@ -997,6 +1032,7 @@ class SessionEntry:
             last_resume_marked_at=last_resume_marked_at,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
+            active_turn_source=active_turn_source,
             is_fresh_reset=data.get("is_fresh_reset", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
@@ -3064,7 +3100,11 @@ class SessionStore:
                 return True
         return False
 
-    def mark_turn_active(self, session_key: str) -> Optional[str]:
+    def mark_turn_active(
+        self,
+        session_key: str,
+        source: Optional[SessionSource] = None,
+    ) -> Optional[str]:
         """Persist exact ownership of the agent turn running for *session_key*.
 
         The opaque token is returned to the caller and must be supplied to
@@ -3081,6 +3121,7 @@ class SessionStore:
             candidate = entry.to_dict()
             candidate["active_turn_token"] = token
             candidate["active_turn_started_at"] = now.isoformat()
+            candidate["active_turn_source"] = source.to_dict() if source else None
             # Keep the legacy 120-second startup heuristic effective during a
             # rolling downgrade/upgrade window where an older binary cannot
             # understand the exact marker fields.
@@ -3095,6 +3136,7 @@ class SessionStore:
             )
             entry.active_turn_token = token
             entry.active_turn_started_at = now
+            entry.active_turn_source = source
             entry.updated_at = now
         return token
 
@@ -3111,6 +3153,7 @@ class SessionStore:
             candidate = entry.to_dict()
             candidate["active_turn_token"] = None
             candidate["active_turn_started_at"] = None
+            candidate["active_turn_source"] = None
 
             # Keep the live token until the clear is durable.  A failed write
             # therefore remains retryable instead of becoming a false mismatch.
@@ -3121,6 +3164,7 @@ class SessionStore:
             )
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+            entry.active_turn_source = None
         return True
 
     def recover_interrupted_turns(
@@ -3160,7 +3204,9 @@ class SessionStore:
                     # marker.  Clear rather than risking an unsafe old resume.
                     marker_is_stale = True
 
+                preserve_interrupted_source = False
                 if not marker_is_stale and not entry.suspended:
+                    preserve_interrupted_source = True
                     if entry.resume_pending:
                         # A drain-timeout marker is more specific than the
                         # generic crash reason; preserve it and its freshness.
@@ -3176,6 +3222,8 @@ class SessionStore:
 
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
+                if not preserve_interrupted_source:
+                    entry.active_turn_source = None
                 changed = True
 
             if changed:
@@ -3195,6 +3243,7 @@ class SessionStore:
                     continue
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
+                entry.active_turn_source = None
                 cleared += 1
             if cleared:
                 self._save()

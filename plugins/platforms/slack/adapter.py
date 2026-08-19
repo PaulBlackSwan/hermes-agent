@@ -2424,6 +2424,48 @@ class SlackAdapter(BasePlatformAdapter):
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
 
+    async def validate_delegation_target(
+        self, user_id: str, team_id: str
+    ) -> Tuple[bool, str, str]:
+        """Validate a temporary-delegation target in the exact Slack workspace."""
+        user_id = str(user_id or "").strip()
+        team_id = str(team_id or "").strip()
+        if not user_id or not team_id:
+            return False, "Slack user and workspace IDs are required", ""
+        bot_user_id = self._team_bot_user_ids.get(team_id) or self._bot_user_id
+        if bot_user_id and user_id == bot_user_id:
+            return False, "Hermes cannot delegate access to itself", ""
+        client = self._team_clients.get(team_id)
+        if client is None:
+            return False, "Slack workspace is not connected for delegation", ""
+        try:
+            response = await client.users_info(user=user_id)
+        except Exception:
+            logger.warning(
+                "[Slack] Failed to validate delegation target user=%s team=%s",
+                user_id,
+                team_id,
+                exc_info=True,
+            )
+            return False, "Slack could not verify that user in this workspace", ""
+        user = (response or {}).get("user")
+        if not isinstance(user, dict) or str(user.get("id") or "") != user_id:
+            return False, "Slack user was not found in this workspace", ""
+        if user.get("deleted"):
+            return False, "Deleted Slack users cannot receive delegation", ""
+        if user.get("is_bot") or user.get("is_app_user"):
+            return False, "Slack bot accounts cannot receive delegation", ""
+        raw_profile = user.get("profile")
+        profile = raw_profile if isinstance(raw_profile, dict) else {}
+        user_name = str(
+            profile.get("display_name")
+            or profile.get("real_name")
+            or user.get("real_name")
+            or user.get("name")
+            or ""
+        ).strip()
+        return True, "", user_name
+
     async def _ensure_dm_conversation(
         self, chat_id: str, team_id: Optional[str] = None
     ) -> str:
@@ -6039,17 +6081,22 @@ class SlackAdapter(BasePlatformAdapter):
         # or file downloads.  The final gateway runner auth check happens
         # after MessageEvent construction, so adapter-side media fetches need
         # the same auth chain up front.
-        _runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
-        _auth_fn = getattr(_runner, "_is_user_authorized", None)
-        if user_id and callable(_auth_fn):
+        if user_id:
             _source = self.build_source(
                 chat_id=channel_id,
                 chat_name="",
                 chat_type="dm" if is_dm else "group",
                 user_id=user_id,
                 user_name="",
+                # Temporary delegation is exact-thread and exact-workspace.
+                # Use Slack's authored thread_ts here, before any history,
+                # mention, or media work. A top-level unauthorized message has
+                # no grantable thread and therefore remains denied.
+                thread_id=event.get("thread_ts") or None,
+                scope_id=str(team_id) if team_id else None,
             )
-            if not _auth_fn(_source):
+            _ingress_authorized = self.authorize_source_at_ingress(_source)
+            if _ingress_authorized is False:
                 logger.warning(
                     "[Slack] Early reject of unauthorized user %s in channel %s",
                     user_id,

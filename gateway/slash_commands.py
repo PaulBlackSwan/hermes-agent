@@ -69,6 +69,47 @@ def _int_value(value: Any) -> int:
         return 0
 
 
+_SLACK_USER_MENTION_RE = re.compile(r"^<@([UW][A-Z0-9]+)(?:\|[^>]+)?>$")
+_DELEGATION_DURATION_RE = re.compile(r"^(\d+)([mhd])$", re.IGNORECASE)
+
+
+def _temporary_delegation_admin_ids() -> set[str]:
+    """Read explicit delegation admins through the active profile secret scope."""
+    raw = ""
+    try:
+        from agent.secret_scope import UnscopedSecretError, get_secret
+
+        try:
+            raw = get_secret("SLACK_DELEGATION_ADMINS") or ""
+        except UnscopedSecretError:
+            return set()
+    except Exception:
+        return set()
+    return {item.strip() for item in str(raw).split(",") if item.strip()}
+
+
+def _parse_temporary_delegation_duration(value: str) -> Optional[int]:
+    match = _DELEGATION_DURATION_RE.fullmatch(str(value or "").strip())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    multiplier = {"m": 60, "h": 3600, "d": 86400}[match.group(2).lower()]
+    seconds = amount * multiplier
+    if not 60 <= seconds <= 86400:
+        return None
+    return seconds
+
+
+def _format_temporary_delegation_remaining(seconds: float) -> str:
+    remaining = max(0, int(seconds + 59))
+    minutes = remaining // 60
+    if minutes % (24 * 60) == 0 and minutes:
+        return f"{minutes // (24 * 60)}d"
+    if minutes % 60 == 0 and minutes:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 
@@ -422,6 +463,16 @@ class GatewaySlashCommandsMixin:
         scope = "DM" if chat_type.lower() in {"dm", "direct", "private", ""} else "group/channel"
         user_id = (source.user_id if source else None) or "?"
 
+        if getattr(source, "temporary_delegated", False):
+            purpose = getattr(source, "delegation_purpose", None) or "(unspecified)"
+            return (
+                f"**You** - {platform} ({scope})\n"
+                f"User ID: `{user_id}`\n"
+                f"Tier: temporary delegate (non-admin)\n"
+                f"Purpose: {purpose}\n"
+                f"Slash commands you can run: /help, /whoami"
+            )
+
         if not policy.enabled:
             return (
                 f"**You** — {platform} ({scope})\n"
@@ -454,6 +505,166 @@ class GatewaySlashCommandsMixin:
             f"User ID: `{user_id}`\n"
             f"Tier: user\n"
             f"Slash commands you can run: {runnable_str}"
+        )
+
+    async def _handle_delegate_command(self, event: MessageEvent) -> str:
+        """Grant, inspect, or revoke exact-thread temporary Slack access."""
+        source = event.source
+        if source.platform != Platform.SLACK:
+            return "/delegate is currently available only in Slack threads."
+
+        caller_id = str(source.user_id or "")
+        if caller_id not in _temporary_delegation_admin_ids():
+            return (
+                "Only configured delegation admins can manage temporary access. "
+                "Set SLACK_DELEGATION_ADMINS to explicit Slack Member IDs."
+            )
+
+        thread_id = str(source.thread_id or "").strip()
+        chat_id = str(source.chat_id or "").strip()
+        scope_id = str(source.scope_id or source.guild_id or "").strip()
+        if not all((thread_id, chat_id, scope_id)):
+            return (
+                "Temporary Slack delegation must be created from inside the "
+                "target thread, with a verified workspace and channel."
+            )
+
+        store_for_source = getattr(self, "_pairing_store_for", None)
+        store: Any = store_for_source(source) if callable(store_for_source) else None
+        if store is None or not hasattr(store, "grant_temporary"):
+            return "Temporary delegation storage is unavailable."
+
+        args = (event.get_command_args() or "").strip()
+        usage = (
+            "Usage: `/delegate <@user> <1m-24h> <purpose>`, "
+            "`/delegate status`, or `/delegate revoke <@user>`. "
+            "When Slack has not registered the native command, send "
+            "`@hermes /delegate ...` in the thread."
+        )
+        if not args:
+            return usage
+
+        if args.lower() == "status":
+            try:
+                grants = store.list_temporary(
+                    platform="slack",
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    scope_id=scope_id,
+                )
+            except Exception:
+                logger.error("Temporary delegation status read failed", exc_info=True)
+                return "Temporary delegation storage is unavailable or corrupted."
+            if not grants:
+                return "No active temporary delegations exist in this Slack thread."
+            now_value = time.time()
+            lines = ["**Active temporary delegations in this thread**"]
+            for grant in grants:
+                remaining = _format_temporary_delegation_remaining(
+                    float(grant["expires_at"]) - now_value
+                )
+                lines.append(
+                    f"- <@{grant['user_id']}>: {remaining} remaining - "
+                    f"{grant['purpose']}"
+                )
+            return "\n".join(lines)
+
+        if args.lower().startswith("revoke "):
+            mention = args.split(None, 1)[1].strip()
+            match = _SLACK_USER_MENTION_RE.fullmatch(mention)
+            if not match:
+                return "Revoke requires one Slack user mention, for example `<@U123>`."
+            target_user_id = match.group(1)
+            try:
+                revoked = store.revoke_temporary(
+                    platform="slack",
+                    user_id=target_user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    scope_id=scope_id,
+                    revoked_by=caller_id,
+                )
+            except Exception:
+                logger.error("Temporary delegation revoke failed", exc_info=True)
+                return "Temporary delegation storage is unavailable or corrupted."
+            if not revoked:
+                return f"No active delegation for <@{target_user_id}> in this thread."
+            return f"Temporary delegation revoked for <@{target_user_id}> in this thread."
+
+        parts = args.split(None, 2)
+        if len(parts) < 2:
+            return usage
+        mention_match = _SLACK_USER_MENTION_RE.fullmatch(parts[0])
+        if not mention_match:
+            return "The first argument must be a Slack user mention such as `<@U123>`."
+        target_user_id = mention_match.group(1)
+        if target_user_id == caller_id:
+            return "You cannot create a temporary delegation for yourself."
+        duration_seconds = _parse_temporary_delegation_duration(parts[1])
+        if duration_seconds is None:
+            return "Invalid duration. Use a value from 1m through 24h, such as `1h`."
+        purpose = parts[2].strip() if len(parts) == 3 else ""
+        if not purpose:
+            return "A delegation purpose is required."
+
+        adapter_for_source = getattr(self, "_adapter_for_source", None)
+        adapter: Any = (
+            adapter_for_source(source) if callable(adapter_for_source) else None
+        )
+        validate_target: Any = getattr(adapter, "validate_delegation_target", None)
+        if not callable(validate_target):
+            return "Slack target validation is unavailable; no delegation was created."
+        try:
+            validation_call: Any = validate_target(target_user_id, scope_id)
+            if not inspect.isawaitable(validation_call):
+                return "Slack target validation is unavailable; no delegation was created."
+            target_valid, target_error, target_user_name = await validation_call
+        except Exception:
+            logger.warning(
+                "Slack delegation target validation failed: target=%s scope=%s",
+                target_user_id,
+                scope_id,
+                exc_info=True,
+            )
+            return "Slack could not validate that target; no delegation was created."
+        if not target_valid:
+            return str(target_error or "Slack rejected that delegation target.")
+
+        try:
+            grant = store.grant_temporary(
+                platform="slack",
+                user_id=target_user_id,
+                user_name=str(target_user_name or ""),
+                chat_id=chat_id,
+                thread_id=thread_id,
+                scope_id=scope_id,
+                granted_by=caller_id,
+                duration_seconds=duration_seconds,
+                purpose=purpose,
+            )
+        except ValueError as exc:
+            return f"Could not create temporary delegation: {exc}"
+        except Exception:
+            logger.error("Temporary delegation grant write failed", exc_info=True)
+            return "Temporary delegation storage is unavailable or corrupted."
+
+        duration_text = _format_temporary_delegation_remaining(duration_seconds)
+        logger.info(
+            "Slack temporary delegation command completed: grantor=%s target=%s "
+            "scope=%s chat=%s thread=%s expires_at=%.3f",
+            caller_id,
+            target_user_id,
+            scope_id,
+            chat_id,
+            thread_id,
+            float(grant["expires_at"]),
+        )
+        return (
+            f"Temporary Slack delegation granted to <@{target_user_id}> for "
+            f"{duration_text} in this thread only.\n"
+            f"Purpose: {grant['purpose']}\n"
+            "The delegate is non-admin, is denied outside this thread, and loses "
+            "access automatically when the grant expires."
         )
 
     async def _handle_kanban_command(self, event: MessageEvent) -> str:

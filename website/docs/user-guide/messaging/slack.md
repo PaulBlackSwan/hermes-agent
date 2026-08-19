@@ -211,6 +211,7 @@ Add the following to your `~/.hermes/.env` file:
 SLACK_BOT_TOKEN=xoxb-your-bot-token-here
 SLACK_APP_TOKEN=xapp-your-app-token-here
 SLACK_ALLOWED_USERS=U01ABC2DEF3              # Comma-separated Member IDs
+SLACK_DELEGATION_ADMINS=U01ABC2DEF3          # Optional, temporary delegation admins only
 
 # Optional
 SLACK_HOME_CHANNEL=C01234567890              # Default channel for cron/scheduled messages
@@ -1019,6 +1020,45 @@ If the bot isn't working in channels, verify **all** of the following:
 ---
 
 ## Security
+
+### Temporary thread-scoped delegation
+
+An explicitly configured delegation admin can temporarily admit another Slack
+member to one existing thread without adding that person to the platform-wide
+allowlist:
+
+```text
+@Hermes /delegate <@U02GUEST123> 1h Review recipe migration feedback only
+```
+
+Use the bot-mention form above when the Slack app manifest has not registered a
+native `/delegate` command. From the same thread, operators can inspect or revoke
+grants:
+
+```text
+@Hermes /delegate status
+@Hermes /delegate revoke <@U02GUEST123>
+```
+
+Delegations are matched against the exact Slack workspace, channel, thread, and
+Member ID. They expire automatically after 1 minute to 24 hours, require a
+purpose, and are stored in a versioned `0600` state file guarded by a
+cross-process lock. Grant, refresh, expiry, invalid-record cleanup, and revoke
+events remain in the same atomic audit history. Delegates remain non-admin even
+when normal slash-command gating is not configured: only `/help` and `/whoami`
+are available to them. Their turns receive an ephemeral system boundary
+restricting work to the operator-supplied purpose and denying cross-chat
+disclosure, credential access, gateway/config changes, and external side effects
+without the grantor's approval. Queued messages are reauthorized when they are
+executed and never merge across different sender or authorization contexts.
+A delegate cannot steer, redirect, or interrupt an owner's active turn, nor
+answer that owner's update, clarification, command-confirmation, or tool-approval
+prompt. Interrupted delegate turns never auto-resume after a gateway restart:
+the delegate must send a fresh, still-authorized message.
+
+`SLACK_DELEGATION_ADMINS` is fail-closed and separate from
+`SLACK_ALLOWED_USERS`. Merely allowing someone to chat with Hermes does not let
+them delegate access to others.
 
 :::warning
 **Always set `SLACK_ALLOWED_USERS`** with the Member IDs of authorized users. Without this setting,

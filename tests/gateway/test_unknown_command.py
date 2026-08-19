@@ -225,3 +225,89 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     # First emit_collect fires on the original command; after rewrite the
     # dispatcher does NOT re-fire for the new command (one decision per turn).
     assert call_log == ["command:status"]
+
+
+@pytest.mark.asyncio
+async def test_command_hook_cannot_rewrite_delegate_floor_to_admin_command():
+    runner = _make_runner()
+    source = _make_source()
+    source.temporary_delegated = True
+    event = MessageEvent(text="/help", source=source, message_id="m1")
+    restart_handler = AsyncMock(
+        side_effect=AssertionError("delegate reached rewritten admin handler")
+    )
+    runner._handle_restart_command = restart_handler
+    runner.hooks.emit_collect = AsyncMock(
+        return_value=[
+            {
+                "decision": "rewrite",
+                "command_name": "restart",
+                "raw_args": "",
+            }
+        ]
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result is not None
+    assert "unavailable to temporary delegates" in result
+    restart_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_temporary_delegate_unknown_or_skill_slash_is_denied_before_dispatch():
+    runner = _make_runner()
+    event = _make_event("/fake-skill")
+    event.source.temporary_delegated = True
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError("delegate slash leaked to skill/agent dispatch")
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result is not None
+    assert "unavailable to temporary delegates" in result
+    runner._run_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_temporary_delegate_cannot_answer_pending_slash_confirmation(monkeypatch):
+    from tools import slash_confirm
+
+    runner = _make_runner()
+    event = _make_event("/approve")
+    event.source.temporary_delegated = True
+    resolve = AsyncMock(return_value="must not resolve")
+    monkeypatch.setattr(
+        slash_confirm,
+        "get_pending",
+        lambda _key: {"confirm_id": "owner-confirm"},
+    )
+    monkeypatch.setattr(slash_confirm, "resolve", resolve)
+
+    result = await runner._handle_message(event)
+
+    assert result is not None
+    assert "unavailable to temporary delegates" in result
+    resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_busy_runner_queues_temporary_delegate_without_steering():
+    runner = _make_runner()
+    event = _make_event("delegate splice")
+    event.source.temporary_delegated = True
+    session_key = build_session_key(event.source)
+    running_agent = MagicMock()
+    running_agent.steer = MagicMock(return_value=True)
+    runner._running_agents[session_key] = running_agent
+    queue_event = MagicMock()
+    runner._queue_or_replace_pending_event = queue_event
+
+    result = await runner._handle_message(event)
+
+    assert result is not None
+    assert "queued as a separate turn" in result
+    queue_event.assert_called_once_with(session_key, event)
+    running_agent.steer.assert_not_called()
+    running_agent.interrupt.assert_not_called()

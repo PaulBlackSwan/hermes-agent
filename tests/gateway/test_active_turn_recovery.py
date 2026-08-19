@@ -284,6 +284,38 @@ def test_exact_old_active_turn_recovers_even_when_updated_at_is_stale(tmp_path):
     assert token
 
 
+def test_active_turn_source_survives_crash_recovery_and_clean_clear(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source("delegate-triggered-turn")
+    entry = store.get_or_create_session(source)
+    token = store.mark_turn_active(entry.session_key, source)
+    assert token is not None
+
+    persisted = _entry_for(store, source)
+    assert persisted.active_turn_source == source
+    assert persisted.to_dict()["active_turn_source"]["user_id"] == source.user_id
+
+    malformed = persisted.to_dict()
+    malformed["active_turn_source"] = "forged"
+    fail_closed = SessionEntry.from_dict(malformed)
+    assert fail_closed.active_turn_token is None
+    assert fail_closed.active_turn_started_at is None
+
+    reloaded = _make_store(tmp_path)
+    assert reloaded.recover_interrupted_turns() == 1
+    recovered = _entry_for(reloaded, source)
+    assert recovered.active_turn_token is None
+    assert recovered.resume_pending is True
+    assert recovered.active_turn_source == source
+
+    clean_source = _make_source("cleanly-finished-turn")
+    clean_entry = store.get_or_create_session(clean_source)
+    clean_token = store.mark_turn_active(clean_entry.session_key, clean_source)
+    assert clean_token is not None
+    assert store.clear_turn_active(clean_entry.session_key, clean_token) is True
+    assert _entry_for(store, clean_source).active_turn_source is None
+
+
 def test_suspended_active_turn_is_cleared_without_resume(tmp_path):
     store = _make_store(tmp_path)
     source = _make_source()

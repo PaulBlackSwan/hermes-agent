@@ -654,6 +654,50 @@ async def test_startup_auto_resume_skips_unauthorized_owner():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_uses_interrupted_source_and_skips_delegate():
+    runner, adapter = make_restart_runner()
+    owner_source = make_restart_source(chat_id="shared-thread")
+    delegate_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="shared-thread",
+        chat_type="dm",
+        user_id="temporary-delegate",
+    )
+    checked = []
+
+    def authorize(source, *, allow_adapter_delegation=True):
+        checked.append(source)
+        source.temporary_delegated = True
+        return True
+
+    runner._is_user_authorized = authorize
+    runner._persist_active_agents = MagicMock()
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:shared-thread",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=owner_source,
+        active_turn_source=delegate_source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    assert checked == [delegate_source]
+    adapter.handle_message.assert_not_called()
+    runner._persist_active_agents.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_reconnect_reschedule_is_platform_scoped():
     """The platform filter limits the pass to that platform's sessions, so
     reconnecting one platform never resumes another's pending session."""

@@ -16,7 +16,7 @@ import os
 import socket
 import sys
 import time
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
@@ -202,6 +202,120 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.VIDEO_CACHE_DIR", tmp_path / "video_cache"
     )
+
+
+@pytest.mark.asyncio
+async def test_early_auth_receives_workspace_thread_and_profile_scope(tmp_path):
+    """Temporary delegation must be checkable before mention/media handling."""
+    slack = SlackAdapter(PlatformConfig(enabled=True, token="test"))
+    captured = []
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "SLACK_DELEGATION_ADMINS=U_SCOPED_ADMIN\n",
+        encoding="utf-8",
+    )
+
+    class Runner:
+        config = SimpleNamespace(multiplex_profiles=True)
+
+        def _profile_name_for_source(self, _source):
+            return None
+
+        def _resolve_profile_home_for_source(self, _source):
+            return profile_home
+
+        def _is_user_authorized(self, source):
+            from agent.secret_scope import get_secret
+            from hermes_constants import get_hermes_home
+
+            captured.append(source)
+            captured.append(
+                (str(get_hermes_home()), get_secret("SLACK_DELEGATION_ADMINS"))
+            )
+            return False
+
+    runner = Runner()
+    setattr(slack, "gateway_runner", runner)
+
+    async def multiplex_closure(_event):
+        raise AssertionError("unauthorized event must not reach the gateway handler")
+
+    assert getattr(multiplex_closure, "__self__", None) is None
+    slack._message_handler = multiplex_closure
+    event = {
+        "type": "message",
+        "text": "<@U_BOT> hello",
+        "user": "U06EGAQ943V",
+        "channel": "C_RECIPES",
+        "channel_type": "channel",
+        "thread_ts": "1787129215.308139",
+        "ts": "1787130000.000001",
+    }
+
+    await slack._handle_slack_message(event, {"team_id": "T_WORKSPACE"})
+
+    assert len(captured) == 2
+    assert captured[0].thread_id == "1787129215.308139"
+    assert captured[0].scope_id == "T_WORKSPACE"
+    assert captured[0].chat_id == "C_RECIPES"
+    assert captured[1] == (str(profile_home), "U_SCOPED_ADMIN")
+
+
+def test_secondary_adapter_stamps_owner_profile_before_ingress_authorization():
+    slack = SlackAdapter(PlatformConfig(enabled=True, token="test"))
+    slack.set_owner_profile("secondary")
+    setattr(
+        slack,
+        "gateway_runner",
+        SimpleNamespace(_profile_name_for_source=lambda _source: None),
+    )
+
+    source = slack.build_source(
+        chat_id="C_RECIPES",
+        chat_type="group",
+        user_id="U_GUEST",
+        thread_id="1787129215.308139",
+        scope_id="T_WORKSPACE",
+    )
+
+    assert source.profile == "secondary"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_payload", "expected", "message_fragment"),
+    [
+        ({"id": "U_GUEST", "deleted": True}, False, "Deleted"),
+        ({"id": "U_GUEST", "is_bot": True}, False, "bot accounts"),
+        ({"id": "U_GUEST", "is_app_user": True}, False, "bot accounts"),
+        ({"id": "U_OTHER"}, False, "not found"),
+        (
+            {
+                "id": "U_GUEST",
+                "profile": {"display_name": "Guest Human"},
+            },
+            True,
+            "",
+        ),
+    ],
+)
+async def test_validate_delegation_target_is_human_and_workspace_scoped(
+    adapter, user_payload, expected, message_fragment
+):
+    team_client = AsyncMock()
+    team_client.users_info = AsyncMock(return_value={"user": user_payload})
+    adapter._team_clients["T_WORKSPACE"] = team_client
+
+    valid, reason, user_name = await adapter.validate_delegation_target(
+        "U_GUEST", "T_WORKSPACE"
+    )
+
+    assert valid is expected
+    assert message_fragment in reason
+    if expected:
+        assert user_name == "Guest Human"
+    team_client.users_info.assert_awaited_once_with(user="U_GUEST")
 
 
 class TestBotEventDiagnostics:
