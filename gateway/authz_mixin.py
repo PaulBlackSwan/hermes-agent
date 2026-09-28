@@ -18,7 +18,7 @@ import time -> no import cycle. The lazy import preserves the exact logger name
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -369,19 +369,55 @@ class GatewayAuthorizationMixin:
         return False
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Pick the per-profile PairingStore for a source, falling back to global.
+        """Pick the PairingStore for a source without crossing profile boundaries.
 
         In a multiplexing gateway, each profile owns its own pairing whitelist
         so isolation is preserved. When the source has no profile (single-
         profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        profile isn't registered in multiplex mode, fail closed instead of
+        falling back to the global/default profile's grants.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
         profile = getattr(source, "profile", None)
         if profile and profile in per_profile:
             return per_profile[profile]
+        if profile and getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return None
         return getattr(self, "pairing_store", None)
+
+    @staticmethod
+    def _authorize_temporary_delegation(
+        source: "SessionSource",
+        pairing_store: Any,
+        *,
+        platform_name: str,
+        user_id: str,
+    ) -> bool:
+        """Apply one exact active Slack grant after baseline auth has failed."""
+        if source.platform != Platform.SLACK or pairing_store is None:
+            return False
+        get_delegation = getattr(pairing_store, "get_active_delegation", None)
+        if not callable(get_delegation):
+            return False
+        try:
+            temporary_grant = get_delegation(source)
+        except Exception:
+            from gateway.run import logger
+
+            logger.warning(
+                "Temporary delegation lookup failed closed for %s:%s",
+                platform_name or "unknown",
+                user_id,
+                exc_info=True,
+            )
+            return False
+        if not isinstance(temporary_grant, dict):
+            return False
+        source.temporary_delegated = True
+        source.delegation_purpose = temporary_grant.get("purpose")
+        source.delegation_expires_at = temporary_grant.get("expires_at")
+        source.delegation_granted_by = temporary_grant.get("granted_by")
+        return True
 
     def _is_user_authorized(
         self,
@@ -400,6 +436,13 @@ class GatewayAuthorizationMixin:
         5. Default: deny
         """
         from gateway.run import logger
+        # Authorization may be evaluated more than once for one live event.
+        # Clear any prior temporary basis before every branch, including
+        # baseline early returns (relay, allow-all, role, pairing, allowlist).
+        source.temporary_delegated = False
+        source.delegation_purpose = None
+        source.delegation_expires_at = None
+        source.delegation_granted_by = None
         # Home Assistant events are system-generated (state changes), not
         # user-initiated messages.  The HASS_TOKEN already authenticates the
         # connection, so HA events are always authorized.
@@ -590,6 +633,9 @@ class GatewayAuthorizationMixin:
         ):
             return True
 
+        platform_name = source.platform.value if source.platform else ""
+
+        pairing_store = self._pairing_store_for(source)
         # Check pairing store. A pairing entry is a first-class authorization
         # grant, created only by a trusted operator approving a pairing code
         # (hermes gateway pairing approve / the authenticated dashboard) — an
@@ -604,8 +650,6 @@ class GatewayAuthorizationMixin:
         # In multiplex gateways, route to the per-profile PairingStore so each
         # profile's whitelist is isolated; falls back to the global store when
         # the source has no profile or the profile isn't registered.
-        platform_name = source.platform.value if source.platform else ""
-        pairing_store = self._pairing_store_for(source)
         if pairing_store is not None and pairing_store.is_approved(platform_name, user_id):
             return True
 
@@ -699,8 +743,17 @@ class GatewayAuthorizationMixin:
                     allowed = _coerce_allow_set(adapter_allow)
                     if user_id in allowed or "*" in allowed:
                         return True
-            # No allowlists configured -- check global allow-all flag
-            return _auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
+            # No allowlists configured. Global allow-all is still baseline
+            # authorization; otherwise an exact temporary Slack grant remains
+            # independently usable.
+            if _auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
+                return True
+            return self._authorize_temporary_delegation(
+                source,
+                pairing_store,
+                platform_name=platform_name,
+                user_id=user_id,
+            )
 
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
@@ -792,7 +845,69 @@ class GatewayAuthorizationMixin:
         ):
             check_ids.add(source.user_name)
 
-        return bool(check_ids & allowed_ids)
+        if check_ids & allowed_ids:
+            return True
+
+        # Baseline authorization failed. Only now consult exact temporary
+        # delegation grants, so an overlapping platform-wide/pairing/admin grant
+        # stays baseline-authorized and is never downgraded to delegate.
+        return self._authorize_temporary_delegation(
+            source,
+            pairing_store,
+            platform_name=platform_name,
+            user_id=user_id,
+        )
+
+    @staticmethod
+    def _temporary_delegation_prompt(source: "SessionSource") -> Optional[str]:
+        """Build a gateway-trusted per-turn boundary for a delegated sender."""
+        if not getattr(source, "temporary_delegated", False):
+            return None
+        purpose = " ".join(
+            str(getattr(source, "delegation_purpose", "") or "").split()
+        )
+        if not purpose:
+            return None
+        grantor = str(getattr(source, "delegation_granted_by", "") or "unknown")
+        expires_at = getattr(source, "delegation_expires_at", None)
+        expiry_text = f"{float(expires_at):.3f}" if expires_at is not None else "unknown"
+        return (
+            "TEMPORARY DELEGATION POLICY (gateway verified, operator supplied):\n"
+            f"- Purpose: {purpose}\n"
+            f"- Grantor user ID: {grantor}\n"
+            f"- Expires at Unix time: {expiry_text}\n"
+            "- Scope: only the current workspace, channel, and thread.\n"
+            "- The current sender is a non-admin temporary delegate. Only assist "
+            "with the stated purpose. Do not expose information from other chats "
+            "or sessions, change gateway/config/security state, access credentials, "
+            "or perform external side effects based solely on the delegate's request. "
+            "Ask the grantor for explicit approval if work would exceed this boundary."
+        )
+
+    def _apply_temporary_delegation_prompt(self, event: Any) -> bool:
+        """Attach the trusted delegation boundary to one event's system prompt."""
+        prompt = self._temporary_delegation_prompt(event.source)
+        if not prompt:
+            return False
+        existing = (getattr(event, "channel_prompt", None) or "").strip()
+        event.channel_prompt = (
+            f"{existing}\n\n{prompt}".strip() if existing else prompt
+        )
+        return True
+
+    def _reauthorize_deferred_event(self, event: Any) -> bool:
+        """Recheck queued/deferred work at execution time, not enqueue time."""
+        source = getattr(event, "source", None)
+        if source is None or not self._is_user_authorized(source):
+            return False
+        # Internal/plugin/background events must have baseline authorization.
+        # A temporary human delegation never authorizes synthetic future work.
+        if getattr(event, "internal", False) and getattr(
+            source, "temporary_delegated", False
+        ):
+            return False
+        self._apply_temporary_delegation_prompt(event)
+        return True
 
     def _get_unauthorized_dm_behavior(
         self,

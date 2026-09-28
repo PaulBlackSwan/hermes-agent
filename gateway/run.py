@@ -9849,6 +9849,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    @staticmethod
+    def _pending_event_security_context(event: MessageEvent) -> tuple:
+        """Return the exact identity and authorization basis for safe merging."""
+        source = event.source
+        platform = getattr(source, "platform", None)
+        return (
+            getattr(platform, "value", platform),
+            getattr(source, "profile", None),
+            getattr(source, "scope_id", None),
+            getattr(source, "guild_id", None),
+            getattr(source, "chat_id", None),
+            getattr(source, "chat_id_alt", None),
+            getattr(source, "parent_chat_id", None),
+            getattr(source, "thread_id", None),
+            getattr(source, "user_id", None),
+            getattr(source, "user_id_alt", None),
+            getattr(source, "is_bot", False),
+            getattr(source, "role_authorized", False),
+            getattr(source, "delivered_via_upstream_relay", False),
+            getattr(source, "temporary_delegated", False),
+            getattr(source, "delegation_purpose", None),
+            getattr(source, "delegation_expires_at", None),
+            getattr(source, "delegation_granted_by", None),
+            getattr(source, "profile_route_rejected", False),
+            getattr(event, "internal", False),
+            getattr(event, "allow_gateway_control", True),
+        )
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
@@ -9871,9 +9899,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "gateway_session_strict",
         )
         same_security_context = existing is not None and (
-            getattr(existing, "internal", False) == getattr(event, "internal", False)
-            and getattr(existing, "allow_gateway_control", True)
-            == getattr(event, "allow_gateway_control", True)
+            self._pending_event_security_context(existing)
+            == self._pending_event_security_context(event)
             and all(
                 (getattr(existing, "metadata", None) or {}).get(key)
                 == (getattr(event, "metadata", None) or {}).get(key)
@@ -10016,6 +10043,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _raw_text = (event.text or "").strip().lower()
                 _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
                 _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
+                _persistent_approve_words = {
+                    "always", "approve always", "always approve",
+                    "session", "approve session", "session approve",
+                }
+                if (
+                    getattr(event.source, "temporary_delegated", False)
+                    and _raw_text
+                    in (_approve_words | _deny_words | _persistent_approve_words)
+                ):
+                    logger.warning(
+                        "Denied dangerous-command approval response from temporary "
+                        "delegate user=%s session=%s",
+                        event.source.user_id,
+                        session_key,
+                    )
+                    _adapter = self._adapter_for_source(event.source)
+                    _send_retry: Any = getattr(_adapter, "_send_with_retry", None)
+                    if callable(_send_retry):
+                        _anchor = self._reply_anchor_for_event(event)
+                        await _send_retry(
+                            chat_id=event.source.chat_id,
+                            content=(
+                                "Temporary delegates cannot approve or deny dangerous "
+                                "commands. The delegation grantor must answer this approval."
+                            ),
+                            reply_to=_anchor,
+                            metadata=self._thread_metadata_for_source(
+                                event.source, _anchor
+                            ),
+                        )
+                    return True
                 _approval_handler = None
                 _normalized_args = ""
                 if _raw_text in _approve_words:
@@ -10085,6 +10143,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         if getattr(event, "internal", False):
             return False
+
+        # A temporary delegate must never splice text into an already-running
+        # owner turn via steer/redirect/interrupt. Queue it as a distinct next
+        # turn instead; the drain path reauthorizes the exact source and applies
+        # the delegation policy before the text reaches the agent.
+        if getattr(event.source, "temporary_delegated", False):
+            logger.info(
+                "Queueing temporary delegate follow-up for reauthorization: "
+                "user=%s session=%s",
+                event.source.user_id,
+                session_key,
+            )
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
@@ -11980,7 +12052,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._is_session_running(entry.session_key):
                 continue
 
-            source = entry.origin
+            # Shared threads keep the first participant as ``origin``. Recover
+            # against the exact interrupted-turn source when available so a
+            # delegate-triggered turn cannot be replayed under the owner's
+            # broader identity after restart.
+            source = entry.active_turn_source or entry.origin
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -12002,6 +12078,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Skipping auto-resume for %s: session owner is no "
                         "longer authorized under the current allowlist",
                         entry.session_key,
+                    )
+                    continue
+                if getattr(source, "temporary_delegated", False):
+                    logger.warning(
+                        "Skipping auto-resume for %s: interrupted turn belonged "
+                        "to temporary delegate %s; a fresh human message is required",
+                        entry.session_key,
+                        getattr(source, "user_id", None),
                     )
                     continue
             except Exception as exc:
@@ -16019,6 +16103,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "approve": self._handle_approve_command,
                 "deny": self._handle_deny_command,
                 "pause": self._handle_pause_command,
+                "delegate": self._handle_delegate_command,
                 "agents": self._handle_agents_command,
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
@@ -16454,6 +16539,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
+        # A matched temporary delegation is authorized for reachability, but it
+        # is not an operator identity. Attach a gateway-owned ephemeral system
+        # boundary to this turn. It is never persisted in transcript history and
+        # cannot be supplied by an inbound sender.
+        self._apply_temporary_delegation_prompt(event)
+
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
         # (background-process completions from IN-FLIGHT work) bypass the
@@ -16538,6 +16629,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _up_state = self._peek_session_state(_quick_key)
         if (
             allow_gateway_control
+            and not getattr(source, "temporary_delegated", False)
             and _up_state is not None
             and _up_state.persistent.update_prompt_pending
         ):
@@ -16621,6 +16713,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _pending_clarify = None
         if (
             allow_gateway_control
+            and not getattr(source, "temporary_delegated", False)
             and _pending_clarify is not None
             and _clarify_mod is not None
         ):
@@ -16706,7 +16799,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _tool_approval_live = has_blocking_approval(_quick_key)
         except Exception:
             _tool_approval_live = False
-        if allow_gateway_control and _pending_confirm and not _tool_approval_live:
+        if (
+            allow_gateway_control
+            and not getattr(source, "temporary_delegated", False)
+            and _pending_confirm
+            and not _tool_approval_live
+        ):
             _raw_reply = (event.text or "").strip()
             # Accept bang-prefixed replies (`!always`, `!cancel`) verbatim.
             # Slack/Matrix instruction text shows the `!` prefix (typed `/`
@@ -16800,6 +16898,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(_quick_key)
 
         if self._is_session_running(_quick_key):
+            _delegate_busy_command = event.get_command()
+            if getattr(source, "temporary_delegated", False):
+                if _delegate_busy_command:
+                    _delegate_denied = self._check_slash_access(
+                        source, _delegate_busy_command
+                    )
+                    if _delegate_denied is not None:
+                        return _delegate_denied
+                else:
+                    self._queue_or_replace_pending_event(_quick_key, event)
+                    return (
+                        "⏳ Your delegated message was queued as a separate turn "
+                        "and will be reauthorized before it runs."
+                    )
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
             # hermes_cli/commands.py) and dispatched through the single
@@ -16812,8 +16924,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /status and /context are intentionally pre-gate so users
             # always see session state.
             if _cmd_def_inner and _cmd_def_inner.name == "status":
+                if getattr(source, "temporary_delegated", False):
+                    return self._check_slash_access(source, "status")
                 return await self._handle_status_command(event)
             if _cmd_def_inner and _cmd_def_inner.name == "context":
+                if getattr(source, "temporary_delegated", False):
+                    return self._check_slash_access(source, "context")
                 return await self._handle_context_command(event)
 
             # Slash command access control on the running-agent fast-path.
@@ -17047,8 +17163,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # run every command. When set → non-admins can run only commands in
         # ``user_allowed_commands`` (plus the always-allowed floor: /help,
         # /whoami). Plain chat is unaffected — only slash commands gate.
-        if command and canonical and is_gateway_known_command(canonical):
-            _denied = self._check_slash_access(source, canonical)
+        if command:
+            _denied = self._check_slash_access(source, canonical or command)
             if _denied is not None:
                 return _denied
 
@@ -17136,8 +17252,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     canonical = _cmd_def.name if _cmd_def else command
                     break
 
+        # A command hook may rewrite a harmless command after the first access
+        # check. Re-run the gate on the final canonical command so temporary
+        # delegates and configured non-admins cannot reach privileged handlers
+        # through a plugin rewrite.
+        if command and canonical:
+            _post_hook_denied = self._check_slash_access(source, canonical)
+            if _post_hook_denied is not None:
+                return _post_hook_denied
+
         if canonical == "pause":
             return await self._handle_pause_command(event)
+
+        if canonical == "delegate":
+            return await self._handle_delegate_command(event)
 
         if canonical == "new":
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
@@ -18357,7 +18485,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         """Persist the exact resolved routing key for this running turn."""
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            token = await self.async_session_store.mark_turn_active(
+                session_key,
+                getattr(event, "source", None),
+            )
         except Exception as exc:
             logger.warning(
                 "Could not persist active-turn marker for %s: %s",
@@ -20781,6 +20912,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not canonical_cmd:
             return None
+        if getattr(source, "temporary_delegated", False):
+            if canonical_cmd in {"help", "whoami"}:
+                return None
+            logger.info(
+                "Slash command /%s denied for temporary delegate %s:%s",
+                canonical_cmd,
+                source.platform.value if source.platform else "?",
+                source.user_id,
+            )
+            return (
+                f"⛔ /{canonical_cmd} is unavailable to temporary delegates. "
+                "Only /help and /whoami are enabled."
+            )
         policy = _policy_for_source(self.config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
@@ -29240,6 +29384,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_type = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    if not self._reauthorize_deferred_event(pending_event):
+                        logger.warning(
+                            "Discarding queued/deferred event after authorization "
+                            "expired or was revoked: platform=%s user=%s session=%s",
+                            getattr(getattr(next_source, "platform", None), "value", "?"),
+                            getattr(next_source, "user_id", None),
+                            session_key or "?",
+                        )
+                        return result or {
+                            "final_response": response,
+                            "messages": history,
+                        }
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",

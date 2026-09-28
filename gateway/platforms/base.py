@@ -7101,7 +7101,46 @@ class BasePlatformAdapter(ABC):
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
-    
+
+    def authorize_source_at_ingress(self, source: SessionSource) -> Optional[bool]:
+        """Run the gateway's synchronous auth evaluator before adapter side effects.
+
+        ``gateway_runner`` is the reliable integration seam under multiplexing;
+        profile message handlers are closures and therefore have no ``__self__``.
+        The bound-handler fallback preserves standalone adapter tests and legacy
+        embeddings. ``None`` means no evaluator is attached, so the authoritative
+        final runner check still decides later.
+        """
+        if getattr(source, "profile_route_rejected", False):
+            return False
+        runner = getattr(self, "gateway_runner", None)
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        if not callable(auth_fn):
+            handler_owner = getattr(self._message_handler, "__self__", None)
+            auth_fn = getattr(handler_owner, "_is_user_authorized", None)
+        if not callable(auth_fn):
+            return None
+        try:
+            if getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+                resolve_home = getattr(runner, "_resolve_profile_home_for_source", None)
+                if not callable(resolve_home):
+                    return False
+                profile_home = Path(str(resolve_home(source)))
+                from gateway.run import _profile_runtime_scope
+
+                with _profile_runtime_scope(profile_home):
+                    return bool(auth_fn(source))
+            return bool(auth_fn(source))
+        except Exception:
+            logger.warning(
+                "%s ingress authorization failed closed for user=%s chat=%s",
+                self.platform.value,
+                source.user_id,
+                source.chat_id,
+                exc_info=True,
+            )
+            return False
+
     def build_source(
         self,
         chat_id: str,
@@ -7135,10 +7174,13 @@ class BasePlatformAdapter(ABC):
             chat_topic = None
 
         # Resolve profile from configured routes (None when no match / no routes)
-        profile = None
+        # A secondary adapter's credential owner is authoritative at ingress.
+        # The profile message-handler has not run yet, so failing to stamp it
+        # here would make early authorization consult the default profile.
+        profile = getattr(self, "_owner_profile", None)
         profile_route_rejected = False
         runner = getattr(self, "gateway_runner", None)
-        if runner is not None:
+        if runner is not None and profile is None:
             from gateway.profile_routing import ProfileRouteRejected
 
             try:

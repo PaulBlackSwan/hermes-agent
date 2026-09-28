@@ -343,6 +343,7 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `SLACK_BOT_TOKEN` | Slack bot token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | Slack app-level token (`xapp-...`, required for Socket Mode) |
 | `SLACK_ALLOWED_USERS` | Comma-separated Slack user IDs |
+| `SLACK_DELEGATION_ADMINS` | Comma-separated Slack Member IDs allowed to create, inspect, and revoke temporary thread-scoped delegations with `/delegate`. Keep narrower than `SLACK_ALLOWED_USERS`. |
 | `SLACK_ALLOW_ALL_USERS` | Allow any Slack user to trigger the bot (dev only). |
 | `SLACK_ALLOW_BOTS` | Accept messages from other Slack bots: `none` (default), `mentions`, or `all`. The bot always ignores its own messages. |
 | `SLACK_THREAD_REQUIRE_MENTION` | Require an explicit @mention for Slack thread replies while preserving top-level free-response channels |
