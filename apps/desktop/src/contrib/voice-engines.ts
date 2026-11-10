@@ -43,9 +43,10 @@ export interface LiveVoiceEngineIO {
   history: LiveVoiceEngineHistoryMessage[]
   /** Hand a request to Hermes. Core runs it as a normal turn on the chat
    *  (`prompt.submit`, surface `voice-live`, `voiceContext` rides the model
-   *  input only) and resolves with the turn's final assistant text, prepared
-   *  for speech (markdown stripped). Resolves empty when the turn produced no
-   *  reply, a newer request superseded it, or the call ended; rejects only
+   *  input only) and resolves with the turn's complete final assistant text,
+   *  without lossy speech normalization (Markdown and tool facts preserved).
+   *  The engine decides how to present it aloud. Resolves empty when the turn
+   *  produced no reply, a newer request superseded it, or the call ended; rejects only
    *  when the turn could not be submitted. */
   delegate: (request: string, voiceContext: string) => Promise<string>
   /** Caption text, for the spoken stop phrase and future live captions. */

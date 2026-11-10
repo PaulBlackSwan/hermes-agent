@@ -7,7 +7,6 @@ import {
   liveVoiceEngineStatus
 } from '@/contrib/voice-engines'
 import { useI18n } from '@/i18n'
-import { sanitizeTextForSpeech } from '@/lib/speech-text'
 import { isVoiceStopCommand } from '@/lib/voice-stop-word'
 import { notify, notifyError } from '@/store/notifications'
 
@@ -68,7 +67,8 @@ let activeCall: null | symbol = null
  * The engine owns its transport and audio; this hook owns the call's life
  * (start, one call at a time, teardown on end/unmount/stop phrase) and the
  * delegation: `io.delegate` runs a normal Hermes turn on the chat and resolves
- * with the turn's final reply text (prepared for speech) once it settles.
+ * with the turn's complete final reply text once it settles. The voice engine
+ * receives facts to reason over, not a TTS script with identifiers removed.
  */
 export function useExtensionVoiceConversation({
   engineId,
@@ -227,7 +227,7 @@ export function useExtensionVoiceConversation({
 
         if (response && !response.pending) {
           latest.current.consumePendingResponse()
-          settleWaiter({ text: sanitizeTextForSpeech(response.text) })
+          settleWaiter({ text: response.text })
 
           return
         }

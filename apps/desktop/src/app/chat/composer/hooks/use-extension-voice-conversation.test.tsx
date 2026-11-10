@@ -151,8 +151,27 @@ describe('useExtensionVoiceConversation', () => {
     state.reply = { id: 'a1', pending: false, text: '**You have** two meetings.' }
     await act(async () => vi.advanceTimersByTimeAsync(400))
 
-    expect(answer).toBe('You have two meetings.')
+    expect(answer).toBe('**You have** two meetings.')
     expect(hook.result.current.status).toBe('listening')
+  })
+
+  it('preserves tool facts for the voice model, including hostnames, paths and table values', async () => {
+    const engine = loadFakeEngine()
+    const { hook, state } = mount()
+    await enable(hook)
+
+    let answer: null | string = null
+    await act(async () => {
+      void engine.ios[0].delegate('Report the hostname and saved report path', '').then(text => (answer = text))
+    })
+
+    const text =
+      'Host: `workstation-7.local`. Report: `/tmp/report.json`.\n\n| Metric | Value |\n| --- | --- |\n| Jobs | 3 |'
+
+    state.reply = { id: 'facts', pending: false, text }
+    await act(async () => vi.advanceTimersByTimeAsync(400))
+
+    expect(answer).toBe(text)
   })
 
   it('a newer request supersedes the one in flight', async () => {
