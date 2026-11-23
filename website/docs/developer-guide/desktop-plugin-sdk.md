@@ -1014,8 +1014,10 @@ ctx.register({
   - `io.sessionId`: the chat the call belongs to.
   - `io.history`: the chat's recent text turns, oldest first.
   - `io.delegate(request, voiceContext)`: runs the request as a Hermes turn and resolves with the
-    turn's final reply text, prepared for speech. It resolves `''` when the turn produced no reply,
-    when a newer request superseded it, or when the call ended. It rejects only when the turn could
+    turn's complete final reply text, including Markdown, identifiers and table values. The engine
+    decides how to present those facts aloud; core does not apply the direct-TTS sanitizer, which
+    removes paths, filenames and other data a voice model may need. It resolves `''` when the turn
+    produced no reply, when a newer request superseded it, or when the call ended. It rejects only when the turn could
     not be submitted. `voiceContext` (the recent spoken exchange) reaches the model input only,
     never the chat transcript.
   - `io.onTranscript('user', text)`: lets core judge the spoken stop phrase ("stop", "goodbye", …).
